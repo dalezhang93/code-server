@@ -1466,17 +1466,19 @@ index 0000000000000000000000000000000000000000..6ce56bec114a6d8daf5dd3ded945ea78
 +}
 diff --git a/src/vs/server/node/channel.ts b/src/vs/server/node/channel.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..6fb1ada50628d3826a493c6e1b58f27a8be428bb
+index 0000000000000000000000000000000000000000..06f284a75d31106f08b7b07c70b82fa96d0d9b4e
 --- /dev/null
 +++ b/src/vs/server/node/channel.ts
-@@ -0,0 +1,437 @@
+@@ -0,0 +1,625 @@
 +import { Server } from '@coder/node-browser';
++import * as os from 'os';
 +import * as path from 'path';
 +import { VSBuffer } from 'vs/base/common/buffer';
 +import { CancellationTokenSource } from 'vs/base/common/cancellation';
 +import { Emitter, Event } from 'vs/base/common/event';
 +import { IDisposable } from 'vs/base/common/lifecycle';
-+import { OS } from 'vs/base/common/platform';
++import * as platform from 'vs/base/common/platform';
++import * as resources from 'vs/base/common/resources';
 +import { ReadableStreamEventPayload } from 'vs/base/common/stream';
 +import { URI, UriComponents } from 'vs/base/common/uri';
 +import { transformOutgoingURIs } from 'vs/base/common/uriIpc';
@@ -1494,8 +1496,14 @@ index 0000000000000000000000000000000000000000..6fb1ada50628d3826a493c6e1b58f27a
 +import { getTranslations } from 'vs/server/node/nls';
 +import { getUriTransformer } from 'vs/server/node/util';
 +import { IFileChangeDto } from 'vs/workbench/api/common/extHost.protocol';
++import { MergedEnvironmentVariableCollection } from 'vs/workbench/contrib/terminal/common/environmentVariableCollection';
 +import * as terminal from 'vs/workbench/contrib/terminal/common/remoteTerminalChannel';
-+import { ITerminalLaunchError } from 'vs/workbench/contrib/terminal/common/terminal';
++import { IShellLaunchConfig, ITerminalEnvironment, ITerminalLaunchError } from 'vs/workbench/contrib/terminal/common/terminal';
++import * as terminalEnvironment from 'vs/workbench/contrib/terminal/common/terminalEnvironment';
++import { getSystemShell } from 'vs/workbench/contrib/terminal/node/terminal';
++import { getMainProcessParentEnv } from 'vs/workbench/contrib/terminal/node/terminalEnvironment';
++import { TerminalProcess } from 'vs/workbench/contrib/terminal/node/terminalProcess';
++import { AbstractVariableResolverService } from 'vs/workbench/services/configurationResolver/common/variableResolver';
 +import { ExtensionScanner, ExtensionScannerInput } from 'vs/workbench/services/extensions/node/extensionPoints';
 +
 +/**
@@ -1724,7 +1732,7 @@ index 0000000000000000000000000000000000000000..6fb1ada50628d3826a493c6e1b58f27a
 +			globalStorageHome: this.environment.globalStorageHome,
 +			workspaceStorageHome: this.environment.workspaceStorageHome,
 +			userHome: this.environment.userHome,
-+			os: OS,
++			os: platform.OS,
 +		};
 +	}
 +
@@ -1833,7 +1841,65 @@ index 0000000000000000000000000000000000000000..6fb1ada50628d3826a493c6e1b58f27a
 +	}
 +}
 +
++class VariableResolverService extends AbstractVariableResolverService {
++	constructor(folders: terminal.IWorkspaceFolderData[], env: platform.IProcessEnvironment) {
++		super({
++			getFolderUri: (name: string): URI | undefined => {
++				const folder = folders.find((f) => f.name === name);
++				return folder && URI.revive(folder.uri);
++			},
++			getWorkspaceFolderCount: (): number => {
++				return folders.length;
++			},
++			getConfigurationValue: (uri: URI, section: string): string | undefined => {
++				throw new Error("not implemented");
++			},
++			getExecPath: (): string | undefined => {
++				return env['VSCODE_EXEC_PATH'];
++			},
++			getFilePath: (): string | undefined => {
++				throw new Error("not implemented");
++			},
++			getSelectedText: (): string | undefined => {
++				throw new Error("not implemented");
++			},
++			getLineNumber: (): string | undefined => {
++				throw new Error("not implemented");
++			}
++		}, undefined, env);
++	}
++}
++
++class Terminal {
++	private readonly process: TerminalProcess;
++
++	public constructor(config: IShellLaunchConfig & { cwd: string }, args: terminal.ICreateTerminalProcessArguments, logService: ILogService) {
++		this.process = new TerminalProcess(
++			config,
++			config.cwd,
++			args.cols,
++			args.rows,
++			process.env as platform.IProcessEnvironment,
++			process.env as platform.IProcessEnvironment, // Environment used for `findExecutable`.
++			false, // windowsEnableConpty: boolean,
++			logService,
++		);
++	}
++
++	public dispose() {
++		this.process.dispose();
++	}
++}
++
++// Based on vs/workbench/api/node/extHostTerminalService.ts.
 +export class TerminalProviderChannel implements IServerChannel<RemoteAgentConnectionContext>, IDisposable {
++	private readonly terminals = new Map<number, Terminal>();
++	private id = 0;
++
++	public constructor (private readonly logService: ILogService) {
++
++	}
++
 +	public listen(_: RemoteAgentConnectionContext, event: string, args?: any): Event<any> {
 +		switch (event) {
 +			case 'onTerminalProcessEvent': return this.onTerminalProcessEvent(args);
@@ -1846,9 +1912,9 @@ index 0000000000000000000000000000000000000000..6fb1ada50628d3826a493c6e1b58f27a
 +		throw new Error('not implemented');
 +	}
 +
-+	public call(_: unknown, command: string, args?: any): Promise<any> {
++	public call(context: RemoteAgentConnectionContext, command: string, args?: any): Promise<any> {
 +		switch (command) {
-+			case '$createTerminalProcess': return this.createTerminalProcess(args);
++			case '$createTerminalProcess': return this.createTerminalProcess(context.remoteAuthority, args);
 +			case '$startTerminalProcess': return this.startTerminalProcess(args);
 +			case '$sendInputToTerminalProcess': return this.sendInputToTerminalProcess(args);
 +			case '$shutdownTerminalProcess': return this.shutdownTerminalProcess(args);
@@ -1864,11 +1930,128 @@ index 0000000000000000000000000000000000000000..6fb1ada50628d3826a493c6e1b58f27a
 +	}
 +
 +	public dispose(): void {
-+		// Nothing yet.
++		this.terminals.forEach((t) => t.dispose());
 +	}
 +
-+	private async createTerminalProcess(args: terminal.ICreateTerminalProcessArguments): Promise<terminal.ICreateTerminalProcessResult> {
-+		throw new Error(`not implemented`);
++	private async createTerminalProcess(remoteAuthority: string, args: terminal.ICreateTerminalProcessArguments): Promise<terminal.ICreateTerminalProcessResult> {
++		const shellLaunchConfig: IShellLaunchConfig = {
++			name: args.shellLaunchConfig.name,
++			executable: args.shellLaunchConfig.executable,
++			args: args.shellLaunchConfig.args,
++			cwd: this.transform(remoteAuthority, args.shellLaunchConfig.cwd),
++			env: args.shellLaunchConfig.env,
++		};
++
++		const activeWorkspaceUri = this.transform(remoteAuthority, args.activeWorkspaceFolder?.uri);
++		const activeWorkspace = activeWorkspaceUri && args.activeWorkspaceFolder ? {
++			...args.activeWorkspaceFolder,
++			uri: activeWorkspaceUri,
++			toResource: (relativePath: string) => resources.joinPath(activeWorkspaceUri, relativePath),
++		} : undefined;
++
++		const resolverService = new VariableResolverService(args.workspaceFolders, process.env as platform.IProcessEnvironment);
++		const resolver = terminalEnvironment.createVariableResolver(activeWorkspace, resolverService);
++
++		// Merge in shell and args from settings
++		if (!shellLaunchConfig.executable) {
++			shellLaunchConfig.executable = terminalEnvironment.getDefaultShell(
++				(key) => args.configuration[key],
++				args.isWorkspaceShellAllowed,
++				getSystemShell(platform.platform),
++				process.env.hasOwnProperty('PROCESSOR_ARCHITEW6432'),
++				process.env.windir,
++				resolver,
++				this.logService,
++				false, // useAutomationShell
++			);
++			shellLaunchConfig.args = terminalEnvironment.getDefaultShellArgs(
++				(key) => args.configuration[key],
++				args.isWorkspaceShellAllowed,
++				false, // useAutomationShell
++				resolver,
++				this.logService,
++			);
++		} else {
++			shellLaunchConfig.executable = resolverService.resolve(activeWorkspace, shellLaunchConfig.executable);
++			if (shellLaunchConfig.args) {
++				if (Array.isArray(shellLaunchConfig.args)) {
++					const resolvedArgs: string[] = [];
++					for (const arg of shellLaunchConfig.args) {
++						resolvedArgs.push(resolverService.resolve(activeWorkspace, arg));
++					}
++					shellLaunchConfig.args = resolvedArgs;
++				} else {
++					shellLaunchConfig.args = resolverService.resolve(activeWorkspace, shellLaunchConfig.args);
++				}
++			}
++		}
++
++		// Get the initial cwd
++		const initialCwd = terminalEnvironment.getCwd(
++			shellLaunchConfig,
++			os.homedir(),
++			resolver,
++			activeWorkspaceUri,
++			args.configuration['terminal.integrated.cwd'],
++			this.logService,
++		);
++		shellLaunchConfig.cwd = initialCwd;
++
++		const getEnvFromConfig = (): terminal.ISingleTerminalConfiguration<ITerminalEnvironment> => {
++			if (platform.isWindows) {
++				return args.configuration['terminal.integrated.env.windows'];
++			} else if (platform.isMacintosh) {
++				return args.configuration['terminal.integrated.env.osx'];
++			}
++			return args.configuration['terminal.integrated.env.linux'];
++		};
++
++		const getNonInheritedEnv = async (): Promise<platform.IProcessEnvironment> => {
++			const env = await getMainProcessParentEnv();
++			env.VSCODE_IPC_HOOK_CLI = process.env['VSCODE_IPC_HOOK_CLI']!;
++			return env;
++		};
++
++		const envFromConfig = getEnvFromConfig();
++		const inheritEnv = args.configuration['terminal.integrated.inheritEnv'];
++		const baseEnv = inheritEnv === false ? process.env as platform.IProcessEnvironment : await getNonInheritedEnv();
++		const env = terminalEnvironment.createTerminalEnvironment(
++			shellLaunchConfig,
++			envFromConfig,
++			resolver,
++			args.isWorkspaceShellAllowed,
++			undefined, // TODO: version
++			args.configuration['terminal.integrated.detectLocale'],
++			baseEnv,
++		);
++
++		// Apply extension environment variable collections to the environment
++		if (!shellLaunchConfig.strictEnv) {
++			// TODO: make this work somehow
++			// const mergedCollection = new MergedEnvironmentVariableCollection(args.envVariableCollections);
++			// mergedCollection.applyToProcessEnvironment(env);
++		}
++
++		// const cwd = this.transform(args.shellLaunchConfig.cwd);
++		// const cwd = typeof uri === "string" ? uri : URI.revive(uri).toString();
++
++		// const terminalId = this.id++;
++		// const terminal = new Terminal(args, this.logService);
++		// this.terminals.set(terminalId, terminal);
++		// return {
++		// 	terminalId,
++		// 	resolvedShellLaunchConfig: terminal.config,
++		// };
++	}
++
++	private transform(remoteAuthority: string, uri: UriComponents | undefined): URI | undefined
++	private transform(remoteAuthority: string, uri: string | UriComponents | undefined): string | URI | undefined
++	private transform(remoteAuthority: string, uri: string | UriComponents | undefined): string | URI | undefined {
++		if (typeof uri === 'string') {
++			return uri;
++		}
++		const transformer = getUriTransformer(remoteAuthority);
++		return uri ? URI.revive(transformer.transformIncoming(uri)) : uri;
 +	}
 +
 +	private async startTerminalProcess(args: terminal.IStartTerminalProcessArguments): Promise<ITerminalLaunchError | void> {
@@ -1904,7 +2087,12 @@ index 0000000000000000000000000000000000000000..6fb1ada50628d3826a493c6e1b58f27a
 +	}
 +
 +	private async listTerminals(args: terminal.IListTerminalsArgs): Promise<terminal.IRemoteTerminalDescriptionDto[]> {
-+		throw new Error('not implemented');
++		// if (args.isInitialization) TODO: Unclear what this should do.
++		return Array.from(this.terminals).map(([id, terminal]) => ({
++			id,
++			pid: terminal.pid,
++			title: terminal.title,
++		}))
 +	}
 +}
 diff --git a/src/vs/server/node/connection.ts b/src/vs/server/node/connection.ts
@@ -2662,7 +2850,7 @@ index 0000000000000000000000000000000000000000..0d9310038c0ca378579652d89bc8ac84
 +}
 diff --git a/src/vs/server/node/server.ts b/src/vs/server/node/server.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..ebd3fbdf7554c63d23ad6bd0e51e0a35a94509dd
+index 0000000000000000000000000000000000000000..c10a5a3a6771a94b2cbcb699bb1261051c71e08b
 --- /dev/null
 +++ b/src/vs/server/node/server.ts
 @@ -0,0 +1,302 @@
@@ -2955,7 +3143,7 @@ index 0000000000000000000000000000000000000000..ebd3fbdf7554c63d23ad6bd0e51e0a35
 +				this.ipc.registerChannel('nodeProxy', new NodeProxyChannel(accessor.get(INodeProxyService)));
 +				this.ipc.registerChannel('localizations', <IServerChannel<any>>createChannelReceiver(accessor.get(ILocalizationsService)));
 +				this.ipc.registerChannel(REMOTE_FILE_SYSTEM_CHANNEL_NAME, new FileProviderChannel(environmentService, logService));
-+				this.ipc.registerChannel(REMOTE_TERMINAL_CHANNEL_NAME, new TerminalProviderChannel());
++				this.ipc.registerChannel(REMOTE_TERMINAL_CHANNEL_NAME, new TerminalProviderChannel(logService));
 +				resolve(new ErrorTelemetry(telemetryService));
 +			});
 +		});
